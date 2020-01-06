@@ -9,45 +9,69 @@ import sys
 import time
 
 
-class Progress:
-    def __init__(self, file=sys.stderr):
+class ProgressLine:
+    def __init__(self, file):
         self._file = file
+
+    def set(self, message, *args):
+        raise NotImplementedError
+
+    def clear(self):
+        raise NotImplementedError
+
+    def log(self, message, *args):
+        raise NotImplementedError
+
+    @classmethod
+    def create(cls, file=sys.stderr):
+        if file.isatty():
+            return TTYProgressLine(file)
+        else:
+            return NoTTYProgressLine(file)
+
+
+class TTYProgressLine(ProgressLine):
+    def __init__(self, *args):
+        super().__init__(*args)
+
         self._last_time = 0
         self._last_progress = ''
 
-        self._is_a_tty = self._file.isatty()
+    def _write_progress(self):
+        print(
+            self._last_progress + '\x1b[K\x1b[G',
+            end='',
+            file=self._file,
+            flush=True)
 
-    def _update(self):
-        if self._is_a_tty:
-            print(
-                self._last_progress + '\x1b[K\x1b[G',
-                end='',
-                file=self._file,
-                flush=True)
-        else:
-            print(self._last_progress, file=self._file, flush=True)
-
-    def set_progress(self, message, *args):
+    def set(self, message, *args):
         current_time = time.time()
 
         if current_time > self._last_time + 0.2:
             self._last_time = current_time
             self._last_progress = message.format(*args)
-            self._update()
+            self._write_progress()
 
     def clear(self):
-        if self._is_a_tty:
-            self._last_progress = ''
-            self._update()
+        self._last_progress = ''
+        self._write_progress()
 
     def log(self, message, *args):
-        if self._is_a_tty:
-            # Not flushing so that _update() can flush the whole thing.
-            print(message.format(*args) + '\x1b[K', file=self._file)
+        # Not flushing so that _write_progress() can flush the whole thing.
+        print(message.format(*args) + '\x1b[K', file=self._file)
 
-            self._update()
-        else:
-            print(message.format(*args), file=self._file, flush=True)
+        self._write_progress()
+
+
+class NoTTYProgressLine(ProgressLine):
+    def set(self, message, *args):
+        pass
+
+    def clear(self):
+        pass
+
+    def log(self, message, *args):
+        print(message.format(*args), file=self._file, flush=True)
 
 
 def format_size(size):
@@ -82,34 +106,44 @@ class HashFile(io.RawIOBase):
         self.hash.update(b)
 
 
-def copy_file_part(fsrc, fdst, size):
+def copy_file_part(fsrc, fdst, size, progress_fn=None):
+    if progress_fn is None:
+        progress_fn = lambda bytes: None
+
     while size > 0:
         data = fsrc.read(min(size, 1 << 14))
 
         if not data:
             break
 
-        size -= len(data)
+        read_size = len(data)
+        size -= read_size
         fdst.write(data)
+
+        progress_fn(read_size)
 
 
 block_size = 1 << 12
 
 
 class File:
-    def __init__(self, path: pathlib.Path, progress):
+    def __init__(self, path: pathlib.Path, processor: 'Processor'):
         self.path = path
-        self._progress = progress
+        self._processor = processor
 
         self._indicators = []
         self._indicators_iter = self._iter_indicators()
 
     def _hash_part(self, pos, size):
+        def progress_fn(bytes):
+            self._processor._data_read += bytes
+            self._processor._update_progress()
+
         hash_file = HashFile()
 
         with self.path.open('rb') as file:
             file.seek(pos)
-            copy_file_part(file, hash_file, size)
+            copy_file_part(file, hash_file, size, progress_fn)
 
         return hash_file.hash.digest().hex()
 
@@ -120,15 +154,16 @@ class File:
 
         for i in itertools.count():
             pos = ((1 << i) - 1) * block_size
+            read_size = min(block_size, size - pos)
 
-            if pos >= size:
+            if read_size <= 0:
                 break
 
-            yield 'block at {}'.format(pos), self._hash_part(pos, block_size)
+            yield 'block at {}'.format(pos), self._hash_part(pos, read_size)
 
         # Do not log small files.
         if size >= 1 << 24:
-            self._progress.log('Fully hashing {} ({}) ...', self.path, format_size(size))
+            self._processor._progress_line.log('Fully hashing {} ({}) ...', self.path, format_size(size))
 
         yield 'file hash', self._hash_part(0, size)
 
@@ -145,39 +180,67 @@ class File:
         return self._indicators[:size]
 
 
-def find_duplicates(paths_iter, progress):
-    # Keys prefixes of the indicators of a file as tuples. Values are either a
-    # single File instance or ... if the entry has spilled because the
-    # indicator prefix was not unique.
-    files_by_indicator_prefixes = {}
-    duplicate_paths_by_indicators = collections.defaultdict(list)
+class Processor:
+    def __init__(self):
+        self._files_processed = 0
+        self._data_read = 0
+        self._duplicates_found = 0
 
-    def insert(file, depth):
-        indicators = tuple(file.get_indicators_prefix(depth))
+        self._progress_line = ProgressLine.create()
 
-        if len(indicators) < depth:
-            duplicate_paths_by_indicators[indicators].append(file.path)
-        else:
-            entry = files_by_indicator_prefixes.get(indicators)
+    def _update_progress(self):
+        self._progress_line.set(
+            '{} files, {} read, {} duplicates ...',
+            self._files_processed,
+            format_size(self._data_read),
+            self._duplicates_found)
 
-            if entry is None:
-                files_by_indicator_prefixes[indicators] = file
+    def find_duplicates(self, paths_iter):
+        self._update_progress()
+
+        # Keys prefixes of the indicators of a file as tuples. Values are
+        # either a single File instance or ... if the entry has spilled because
+        # the indicator prefix was not unique.
+        files_by_indicator_prefixes = {}
+        duplicate_paths_by_indicators = collections.defaultdict(list)
+
+        def insert(file, depth):
+            indicators = tuple(file.get_indicators_prefix(depth))
+
+            if len(indicators) < depth:
+                duplicate_paths_by_indicators[indicators].append(file.path)
+
+                self._duplicates_found += 1
+                self._update_progress()
             else:
-                insert(file, depth + 1)
+                entry = files_by_indicator_prefixes.get(indicators)
 
-                if entry is not ...:
-                    files_by_indicator_prefixes[indicators] = ...
-                    insert(entry, depth + 1)
+                if entry is None:
+                    files_by_indicator_prefixes[indicators] = file
+                else:
+                    insert(file, depth + 1)
 
-    for path in paths_iter:
-        insert(File(path, progress), 1)
+                    if entry is not ...:
+                        files_by_indicator_prefixes[indicators] = ...
+                        insert(entry, depth + 1)
 
-    def iter_duplicates():
-        for indicator, paths in duplicate_paths_by_indicators.items():
-            # Extract size and full hash of file.
-            yield paths, indicator[0][1], indicator[-1][1]
+        for path in paths_iter:
+            insert(File(path, self), 1)
 
-    return sorted(iter_duplicates())
+            self._files_processed += 1
+            self._update_progress()
+
+        def iter_duplicates():
+            for indicator, paths in duplicate_paths_by_indicators.items():
+                # Extract size and full hash of file.
+                yield sorted(paths), indicator[0][1], indicator[-1][1]
+
+        duplicates = sorted(iter_duplicates())
+
+        self._progress_line.clear()
+        self._progress_line.log('{} groups of identical files have been found.', len(duplicates))
+
+        return duplicates
 
 
 def parse_args():
@@ -195,8 +258,6 @@ def parse_args():
 
 
 def main(root_dirs, stdin):
-    progress = Progress()
-
     def iter_all_paths():
         if stdin:
             for line in sys.stdin:
@@ -208,19 +269,7 @@ def main(root_dirs, stdin):
             for root_dir in root_dirs:
                 yield from iter_regular_files(root_dir)
 
-    def iter_all_paths_with_progress():
-        files_count = 0
-
-        for i in iter_all_paths():
-            files_count += 1
-            progress.set_progress('Processing {} files ...', files_count)
-
-            yield i
-
-    duplicates = find_duplicates(iter_all_paths_with_progress(), progress)
-
-    progress.clear()
-    progress.log('{} groups of identical files have been found.', len(duplicates))
+    duplicates = Processor().find_duplicates(iter_all_paths())
 
     for paths, size, hash in sorted(sorted(i for i in duplicates)):
         print()
