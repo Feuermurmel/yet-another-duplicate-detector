@@ -50,6 +50,21 @@ class Progress:
             print(message.format(*args), file=self._file, flush=True)
 
 
+def format_size(size):
+    if size < 1000:
+        return '{} bytes'.format(size)
+
+    for unit in 'KMGTPEZY':
+        size = size / 1000
+
+        if size < 10:
+            return '{:.2f} {}B'.format(size, unit)
+        elif size < 100:
+            return '{:.1f} {}B'.format(size, unit)
+        elif size < 1000 or unit == 'Y':
+            return '{:.0f} {}B'.format(size, unit)
+
+
 def iter_regular_files(root: pathlib.Path):
     for dirpath, dirnames, filenames in os.walk(str(root)):
         for i in filenames:
@@ -113,7 +128,7 @@ class File:
 
         # Do not log small files.
         if size >= 1 << 24:
-            self._progress.log('Fully hashing {} ({:.1f} MB) ...', self.path, size / 1e6)
+            self._progress.log('Fully hashing {} ({}) ...', self.path, format_size(size))
 
         yield 'file hash', self._hash_part(0, size)
 
@@ -157,7 +172,12 @@ def find_duplicates(paths_iter, progress):
     for path in paths_iter:
         insert(File(path, progress), 1)
 
-    return list(duplicate_paths_by_indicators.values())
+    def iter_duplicates():
+        for indicator, paths in duplicate_paths_by_indicators.items():
+            # Extract size and full hash of file.
+            yield paths, indicator[0][1], indicator[-1][1]
+
+    return sorted(iter_duplicates())
 
 
 def parse_args():
@@ -202,10 +222,11 @@ def main(root_dirs, stdin):
     progress.clear()
     progress.log('{} groups of identical files have been found.', len(duplicates))
 
-    for group in sorted(sorted(i for i in duplicates)):
+    for paths, size, hash in sorted(sorted(i for i in duplicates)):
         print()
+        print('{} files with {} and SHA 256 hash {}...:'.format(len(paths), format_size(size), hash[:16]))
 
-        for path in group:
+        for path in paths:
             print(path)
 
 
