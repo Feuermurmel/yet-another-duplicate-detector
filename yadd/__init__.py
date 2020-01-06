@@ -5,16 +5,49 @@ import io
 import itertools
 import os
 import pathlib
-import re
 import sys
+import time
 
 
-def log(message, *args):
-    print(message.format(*args), file=sys.stderr, flush=False)
+class Progress:
+    def __init__(self, file=sys.stderr):
+        self._file = file
+        self._last_time = 0
+        self._last_progress = ''
 
+        self._is_a_tty = self._file.isatty()
 
-def bash_escape_string(string):
-    return "'{}'".format(re.sub("'", "'\"'\"'", string))
+    def _update(self):
+        if self._is_a_tty:
+            print(
+                self._last_progress + '\x1b[K\x1b[G',
+                end='',
+                file=self._file,
+                flush=True)
+        else:
+            print(self._last_progress, file=self._file, flush=True)
+
+    def set_progress(self, message, *args):
+        current_time = time.time()
+
+        if current_time > self._last_time + 0.2:
+            self._last_time = current_time
+            self._last_progress = message.format(*args)
+            self._update()
+
+    def clear(self):
+        if self._is_a_tty:
+            self._last_progress = ''
+            self._update()
+
+    def log(self, message, *args):
+        if self._is_a_tty:
+            # Not flushing so that _update() can flush the whole thing.
+            print(message.format(*args) + '\x1b[K', file=self._file)
+
+            self._update()
+        else:
+            print(message.format(*args), file=self._file, flush=True)
 
 
 def iter_regular_files(root: pathlib.Path):
@@ -49,17 +82,18 @@ block_size = 1 << 12
 
 
 class File:
-    def __init__(self, path: pathlib.Path):
+    def __init__(self, path: pathlib.Path, progress):
         self.path = path
+        self._progress = progress
 
         self._indicators = []
         self._indicators_iter = self._iter_indicators()
 
-    def _hash_part(self, post, size):
+    def _hash_part(self, pos, size):
         hash_file = HashFile()
 
         with self.path.open('rb') as file:
-            file.seek(post)
+            file.seek(pos)
             copy_file_part(file, hash_file, size)
 
         return hash_file.hash.digest().hex()
@@ -77,7 +111,9 @@ class File:
 
             yield 'block at {}'.format(pos), self._hash_part(pos, block_size)
 
-        log('Fully hashing {} ...', self.path)
+        # Do not log small files.
+        if size >= 1 << 24:
+            self._progress.log('Fully hashing {} ({:.1f} MB) ...', self.path, size / 1e6)
 
         yield 'file hash', self._hash_part(0, size)
 
@@ -94,7 +130,7 @@ class File:
         return self._indicators[:size]
 
 
-def find_duplicates(paths_iter):
+def find_duplicates(paths_iter, progress):
     # Keys prefixes of the indicators of a file as tuples. Values are either a
     # single File instance or ... if the entry has spilled because the
     # indicator prefix was not unique.
@@ -119,7 +155,7 @@ def find_duplicates(paths_iter):
                     insert(entry, depth + 1)
 
     for path in paths_iter:
-        insert(File(path), 1)
+        insert(File(path, progress), 1)
 
     return list(duplicate_paths_by_indicators.values())
 
@@ -139,6 +175,8 @@ def parse_args():
 
 
 def main(root_dirs, stdin):
+    progress = Progress()
+
     def iter_all_paths():
         if stdin:
             for line in sys.stdin:
@@ -150,15 +188,25 @@ def main(root_dirs, stdin):
             for root_dir in root_dirs:
                 yield from iter_regular_files(root_dir)
 
-    duplicates = find_duplicates(iter_all_paths())
+    def iter_all_paths_with_progress():
+        files_count = 0
 
-    log('{} groups of identical files have been found.', len(duplicates))
+        for i in iter_all_paths():
+            files_count += 1
+            progress.set_progress('Processing {} files ...', files_count)
 
-    for i in duplicates:
+            yield i
+
+    duplicates = find_duplicates(iter_all_paths_with_progress(), progress)
+
+    progress.clear()
+    progress.log('{} groups of identical files have been found.', len(duplicates))
+
+    for group in duplicates:
         print()
 
-        for j in i:
-            print(j)
+        for path in group:
+            print(path)
 
 
 def entry_point():
