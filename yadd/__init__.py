@@ -92,7 +92,7 @@ def format_size(size):
 def iter_regular_files(root: pathlib.Path):
     for dirpath, dirnames, filenames in os.walk(str(root)):
         for i in filenames:
-            path = root / dirpath / i
+            path = pathlib.Path(dirpath) / i
 
             if path.is_file() and not path.is_symlink():
                 yield path
