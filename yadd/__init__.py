@@ -202,7 +202,7 @@ def main(root_dirs, stdin):
     progress.clear()
     progress.log('{} groups of identical files have been found.', len(duplicates))
 
-    for group in duplicates:
+    for group in sorted(sorted(i for i in duplicates)):
         print()
 
         for path in group:
