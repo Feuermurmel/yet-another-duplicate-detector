@@ -94,7 +94,7 @@ class File:
         return self._indicators[:size]
 
 
-def find_duplicates(paths):
+def find_duplicates(paths_iter):
     # Keys prefixes of the indicators of a file as tuples. Values are either a
     # single File instance or ... if the entry has spilled because the
     # indicator prefix was not unique.
@@ -118,8 +118,8 @@ def find_duplicates(paths):
                     files_by_indicator_prefixes[indicators] = ...
                     insert(entry, depth + 1)
 
-    for i in paths:
-        insert(File(i), 1)
+    for path in paths_iter:
+        insert(File(path), 1)
 
     return list(duplicate_paths_by_indicators.values())
 
@@ -150,8 +150,7 @@ def main(root_dirs, stdin):
             for root_dir in root_dirs:
                 yield from iter_regular_files(root_dir)
 
-    all_paths = sorted(set(iter_all_paths()))
-    duplicates = find_duplicates(all_paths)
+    duplicates = find_duplicates(iter_all_paths())
 
     log('{} groups of identical files have been found.', len(duplicates))
 
