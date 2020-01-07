@@ -1,68 +1,115 @@
 import collections
+import functools
+import itertools
+import pathlib
+import typing
 
-from yadd.util import format_size
-from yadd.file import File
-from yadd.statusline import StatusLine
+from yadd.util import hash_file_part, Logger, format_size
 
 
-class Processor:
-    def __init__(self):
-        self._files_processed = 0
-        self._data_read = 0
-        self._duplicates_found = 0
+class _File:
+    """
+    Wraps the path of a regular file and provides access to prefixes of a
+    lazily calculated list of indicators, which can be used to tell two files
+    apart.
+    """
 
-        self._status_line = StatusLine.create()
+    def __init__(
+            self,
+            path: pathlib.Path,
+            indicators_iter: typing.Iterator[typing.Any]):
+        self.path = path
 
-    def _update_status(self):
-        self._status_line.set(
-            '{} files, {} read, {} duplicates ...',
-            self._files_processed,
-            format_size(self._data_read),
-            self._duplicates_found)
+        self._indicators_iter = indicators_iter
+        self._indicators = []
 
-    def find_duplicates(self, paths_iter):
-        self._update_status()
+    def get_indicators_prefix(self, length: int):
+        """
+        Return a prefix of the list of indicators of this file.
 
-        # Keys prefixes of the indicators of a file as tuples. Values are
-        # either a single File instance or ... if the entry has spilled because
-        # the indicator prefix was not unique.
-        files_by_indicator_prefixes = {}
-        duplicate_paths_by_indicators = collections.defaultdict(list)
+        Longer prefixes are more work to calculate but also are more likely to
+        tell two files apart that are indeed different.
+        """
 
-        def insert(file, depth):
-            indicators = tuple(file.get_indicators_prefix(depth))
+        while length > len(self._indicators):
+            element = next(self._indicators_iter, None)
 
-            if len(indicators) < depth:
-                duplicate_paths_by_indicators[indicators].append(file.path)
+            # Return a short list instead of raising an exception.
+            if element is None:
+                break
 
-                self._duplicates_found += 1
-                self._update_status()
+            self._indicators.append(element)
+
+        return self._indicators[:length]
+
+
+_block_size = 1 << 12
+
+
+def find_duplicates(
+        paths_iter: typing.Iterable[pathlib.Path],
+        *, file_processed_progress_fn: typing.Callable[[], None],
+        data_read_progress_fn: typing.Callable[[int], None],
+        duplicate_found_progress_fn: typing.Callable[[], None],
+        logger: Logger):
+    # Keys prefixes of the indicators of a file as tuples. Values are either a
+    # single File instance or `...`, if the entry has spilled because the
+    # indicator prefix was not unique.
+    files_by_indicator_prefixes = {}
+    duplicate_paths_by_indicators = collections.defaultdict(list)
+
+    def insert(file, depth):
+        indicators = tuple(file.get_indicators_prefix(depth))
+
+        if len(indicators) < depth:
+            duplicate_paths_by_indicators[indicators].append(file.path)
+            duplicate_found_progress_fn()
+        else:
+            entry = files_by_indicator_prefixes.get(indicators)
+
+            if entry is None:
+                files_by_indicator_prefixes[indicators] = file
             else:
-                entry = files_by_indicator_prefixes.get(indicators)
+                insert(file, depth + 1)
 
-                if entry is None:
-                    files_by_indicator_prefixes[indicators] = file
-                else:
-                    insert(file, depth + 1)
+                if entry is not ...:
+                    files_by_indicator_prefixes[indicators] = ...
+                    insert(entry, depth + 1)
 
-                    if entry is not ...:
-                        files_by_indicator_prefixes[indicators] = ...
-                        insert(entry, depth + 1)
+    for path in paths_iter:
+        def iter_indicators(path=path):
+            hash_part = functools.partial(
+                hash_file_part,
+                path,
+                progress_fn=data_read_progress_fn)
 
-        for path in paths_iter:
-            insert(File(path, self), 1)
+            size = path.stat().st_size
 
-            self._files_processed += 1
-            self._update_status()
+            yield 'size', size
 
-        def iter_duplicates():
-            for indicator, paths in duplicate_paths_by_indicators.items():
-                # Extract size and full hash of file.
-                yield sorted(paths), indicator[0][1], indicator[-1][1]
+            for i in itertools.count():
+                pos = ((1 << i) - 1) * _block_size
+                read_size = min(_block_size, size - pos)
 
-        duplicates = sorted(iter_duplicates())
+                if read_size <= 0:
+                    break
 
-        self._status_line.clear()
-        self._status_line.log('{} groups of identical files have been found.', len(duplicates))
+                yield 'block at {}'.format(pos), hash_part(pos, read_size)
 
-        return duplicates
+            # Do not log small files.
+            if size >= 1 << 24:
+                logger.log('Fully hashing {} ({}) ...', path, format_size(size))
+
+            yield 'file hash', hash_part(0, size)
+
+        insert(_File(path, iter_indicators()), 1)
+        file_processed_progress_fn()
+
+    def iter_duplicates():
+        for indicators, paths in duplicate_paths_by_indicators.items():
+            # Extract size and full hash of file.
+            yield sorted(paths), indicators[0][1], indicators[-1][1]
+
+    duplicates = sorted(iter_duplicates())
+
+    return duplicates

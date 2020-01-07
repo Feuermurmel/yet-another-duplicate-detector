@@ -3,8 +3,10 @@ import sys
 import time
 import typing
 
+from yadd.util import Logger
 
-class StatusLine:
+
+class StatusLine(Logger):
     """
     Wraps a file-like object and abstract displaying a progress/status-line
     on the last line of the console which still allowing log lines to be

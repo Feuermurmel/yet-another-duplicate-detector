@@ -1,3 +1,5 @@
+import hashlib
+import io
 import os
 import pathlib
 import typing
@@ -27,7 +29,7 @@ def copy_file_part(
         fsrc: typing.BinaryIO,
         fdst: typing.BinaryIO,
         size: int,
-        progress_fn: typing.Callable[[int], None] = None):
+        *, progress_fn: typing.Callable[[int], None] = None):
     """
     Variant of shutil.copyfile() which allows only a section of a file to be
     copied and allows a callback to be specified over which copy progress is
@@ -59,6 +61,33 @@ def copy_file_part(
         progress_fn(read_size)
 
 
+class _HashFile(io.RawIOBase):
+    """
+    A simple file-like object which calculates a hash of all data written to
+    it.
+    """
+
+    def __init__(self, hash=hashlib.sha256):
+        self.hash = hash()
+
+    def write(self, b):
+        self.hash.update(b)
+
+
+def hash_file_part(
+        path: pathlib.Path,
+        pos: int,
+        size: int,
+        *, progress_fn: typing.Callable[[int], None]):
+    hash_file = _HashFile()
+
+    with path.open('rb') as file:
+        file.seek(pos)
+        copy_file_part(file, hash_file, size, progress_fn=progress_fn)
+
+    return hash_file.hash.digest().hex()
+
+
 def iter_regular_files(root: pathlib.Path):
     """
     Return an iterator yielding paths to all regular files under the specified
@@ -71,3 +100,8 @@ def iter_regular_files(root: pathlib.Path):
 
             if path.is_file() and not path.is_symlink():
                 yield path
+
+
+class Logger:
+    def log(self, message, *args):
+        raise NotImplementedError
