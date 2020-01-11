@@ -10,18 +10,18 @@ from yadd.util import iter_regular_files, format_size
 def parse_args():
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('root_dirs', nargs='*', type=pathlib.Path)
+    parser.add_argument('paths', nargs='*', type=pathlib.Path)
     parser.add_argument('-i', '--stdin', action='store_true')
 
     args = parser.parse_args()
 
-    if bool(args.root_dirs) == args.stdin:
+    if bool(args.paths) == args.stdin:
         parser.error('Exactly one of root_dirs and --stdin must be specified.')
 
     return args
 
 
-def main(root_dirs, stdin):
+def main(paths, stdin):
     def iter_all_paths():
         if stdin:
             for line in sys.stdin:
@@ -30,8 +30,11 @@ def main(root_dirs, stdin):
 
                 yield pathlib.Path(line)
         else:
-            for root_dir in root_dirs:
-                yield from iter_regular_files(root_dir)
+            for path in paths:
+                if path.is_dir():
+                    yield from iter_regular_files(path)
+                else:
+                    yield path
 
     status_line = StatusLine.create()
     files_processed = 0
