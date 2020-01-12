@@ -94,12 +94,21 @@ def iter_regular_files(root: pathlib.Path):
     directory.
     """
 
-    for dirpath, dirnames, filenames in os.walk(str(root)):
-        for i in filenames:
-            path = pathlib.Path(dirpath) / i
+    # Using this instead of os.walk because we want a stable, predictable order
+    # in which files are visited. This does not gain any technical benefit but
+    # allows a user to relate the log output to how much progress has been
+    # made.
+    def walk_dir(path):
+        for i in sorted(path.iterdir()):
+            # Follow symlinks specified as the root on the command line but
+            # ignore them otherwise.
+            if not i.is_symlink():
+                if i.is_file():
+                    yield i
+                elif i.is_dir():
+                    yield from walk_dir(i)
 
-            if path.is_file() and not path.is_symlink():
-                yield path
+    return walk_dir(root)
 
 
 class Logger:
